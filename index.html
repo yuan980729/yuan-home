@@ -435,14 +435,12 @@ select.input-field{
 
 <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
 <script>
-// ============ 全局数据管理（Supabase 实时同步版） ============
-// 配置：在 Sync 页面输入 Supabase URL 和 Anon Key
-// 或直接在这里写死：
-// const SUPABASE_CONFIG = { url:'https://xxx.supabase.co', key:'eyJh...' };
-
+// ============ 全局数据管理（Supabase 实时同步版 v2） ============
 let _supabase = null;
 let _realtimeChannel = null;
 let _dbReady = false;
+let _syncing = false;       // 正在拉取/推送中，禁止再触发
+let _initPhase = true;      // 初始化阶段，禁止推送
 
 function getSupabaseConfig(){
   const raw = localStorage.getItem('yk_supabase_cfg');
@@ -461,7 +459,6 @@ async function initSupabase(){
       auth: { persistSession: false, autoRefreshToken: false, detectSessionInUrl: false },
       realtime: { params: { eventsPerSecond: 10 } }
     });
-    // 测试连接：查一下 goals 表
     const { error } = await _supabase.from('goals').select('id').limit(1);
     if(error){
       console.warn('Supabase connect error:', error.message, error.code);
@@ -472,9 +469,8 @@ async function initSupabase(){
   }catch(e){ console.warn('Supabase init error:', e); return false; }
 }
 
-// ============ DB API（兼容旧接口，内部转 Supabase） ============
+// ============ DB API ============
 const DB = {
-  // 本地缓存 + Supabase 双写
   load(key, def){
     try{
       const v = localStorage.getItem('yk_'+key);
@@ -484,79 +480,81 @@ const DB = {
 
   save(key, val){
     localStorage.setItem('yk_'+key, JSON.stringify(val));
-    this._pushToSupabase(key, val);
+    // 初始化阶段或同步中不推送，防止回环
+    if(!_initPhase && !_syncing){
+      this._pushToSupabase(key, val);
+    }
   },
 
-  // Supabase 专用方法
+  // 推送单条数据到 Supabase（只 upsert，不 delete）
   async _pushToSupabase(key, val){
-    if(!_dbReady || !_supabase) return;
+    if(!_dbReady || !_supabase || _syncing) return;
+    _syncing = true;
     try{
       const tbl = key.replace('yk_','');
       if(tbl === 'checkin_logs'){
-        // checkin_logs 是对象格式 {checkinId: [dates]}
-        const existing = await _supabase.from('checkin_logs').select('*').limit(1);
-        if(existing.data?.length > 0){
+        const { data: existing } = await _supabase.from('checkin_logs').select('id').eq('id','singleton').limit(1);
+        if(existing && existing.length > 0){
           await _supabase.from('checkin_logs').update({data:val}).eq('id','singleton');
         }else{
           await _supabase.from('checkin_logs').insert({id:'singleton',data:val});
         }
       }else if(tbl === 'cats'){
-        // cats 是 {goals:[],checkins:[],...} 格式
         for(const [module, catData] of Object.entries(val)){
-          const existing = await _supabase.from('cats').select('*').eq('module',module).limit(1);
-          if(existing.data?.length > 0){
+          const { data: existing } = await _supabase.from('cats').select('module').eq('module',module).limit(1);
+          if(existing && existing.length > 0){
             await _supabase.from('cats').update({cat_data:catData}).eq('module',module);
           }else{
             await _supabase.from('cats').insert({module,cat_data:catData});
           }
         }
       }else if(tbl === 'trash'){
-        // trash 是数组，先清空再全量写入
-        await _supabase.from('trash').delete().neq('id','__never__');
         if(val.length > 0){
           const rows = val.map(t=>({id:t.id,type:t.type,data:t.data,deleted_at:t.deletedAt}));
-          await _supabase.from('trash').insert(rows);
+          await _supabase.from('trash').upsert(rows,{onConflict:'id'});
         }
-      }else if(Array.isArray(val)){
-        // goals / checkins / notes / wishes / chat
-        // 策略：upsert 每条记录
-        if(val.length === 0){
-          await _supabase.from(tbl).delete().neq('id','__never__');
-        }else{
-          const rows = val.map(v=>{
-            const r = {...v};
-            if(tbl==='goals'){ r.cat_id=r.catId; r.updated_at=new Date().toISOString(); delete r.catId; }
-            if(tbl==='checkins'){ r.cat_id=r.catId; r.updated_at=new Date().toISOString(); delete r.catId; if(r.remindTime){ r.remind_time=r.remindTime; delete r.remindTime; } }
-            if(tbl==='notes'){ r.cat_id=r.catId; r.updated_at=new Date().toISOString(); delete r.catId; }
-            if(tbl==='wishes'){ r.cat_id=r.catId; r.updated_at=new Date().toISOString(); delete r.catId; }
-            if(tbl==='chat'){ r.role=r.role; r.created_at=r.createdAt||new Date().toISOString(); delete r.createdAt; }
-            return r;
-          });
-          await _supabase.from(tbl).upsert(rows,{onConflict:'id'});
-        }
+      }else if(Array.isArray(val) && val.length > 0){
+        const rows = val.map(v=>{
+          const r = {...v};
+          if(r.catId){ r.cat_id=r.catId; delete r.catId; }
+          if(r.remindTime){ r.remind_time=r.remindTime; delete r.remindTime; }
+          if(r.createdAt){ r.created_at=r.createdAt; }
+          if(r.updatedAt){ r.updated_at=r.updatedAt; }
+          r.updated_at = new Date().toISOString();
+          return r;
+        });
+        await _supabase.from(tbl).upsert(rows,{onConflict:'id'});
       }
-    }catch(e){ console.warn('Supabase push error:', tbl||key, e.message); }
+      // 空数组不做任何操作
+    }catch(e){ console.warn('Supabase push error:', key, e.message); }
+    finally{
+      _syncing = false;  // ← 无论成功失败都释放锁
+    }
   },
 
-  // 从 Supabase 拉取全部数据
+  // 从 Supabase 拉取全部数据（直接覆盖本地，不触发推送）
   async pullAll(){
-    if(!_dbReady || !_supabase) return false;
+    if(!_dbReady || !_supabase || _syncing) return false;
+    _syncing = true;
     try{
-      const tables = ['goals','checkins','notes','wishes','trash','cats','chat'];
+      const tables = ['goals','checkins','checkin_logs','notes','wishes','trash','cats','chat'];
       for(const tbl of tables){
-        const {data} = await _supabase.from(tbl).select('*');
+        const { data, error } = await _supabase.from(tbl).select('*');
+        if(error){ console.warn('Pull error:', tbl, error.message); continue; }
         if(!data) continue;
-        if(tbl === 'trash'){
-          localStorage.setItem('yk_trash', JSON.stringify(data.map(r=>({id:r.id,type:r.type,data:r.data,deletedAt:r.deleted_at}))));
+
+        if(tbl === 'checkin_logs'){
+          if(data.length > 0 && data[0].data){
+            localStorage.setItem('yk_checkin_logs', JSON.stringify(data[0].data));
+          }
         }else if(tbl === 'cats'){
           const catsObj = {};
           data.forEach(r=>{ catsObj[r.module] = r.cat_data; });
           localStorage.setItem('yk_cats', JSON.stringify(catsObj));
-        }else if(tbl === 'checkin_logs'){
-          if(data.length > 0 && data[0].data){
-            localStorage.setItem('yk_checkin_logs', JSON.stringify(data[0].data));
-          }
+        }else if(tbl === 'trash'){
+          localStorage.setItem('yk_trash', JSON.stringify(data.map(r=>({id:r.id,type:r.type,data:r.data,deletedAt:r.deleted_at}))));
         }else{
+          // goals / checkins / notes / wishes / chat
           const arr = data.map(r=>{
             const v = {...r};
             delete v.device_id; delete v.created_at; delete v.updated_at;
@@ -570,13 +568,12 @@ const DB = {
       }
       return true;
     }catch(e){ console.warn('Supabase pull error:', e.message); return false; }
+    finally{
+      _syncing = false;  // ← 无论成功失败都释放锁
+    }
   },
 
-  isCloudEnabled(){
-    return _dbReady;
-  },
-
-  // 兼容旧接口
+  isCloudEnabled(){ return _dbReady; },
   getBlobUrl(){ return ''; },
   setBlobUrl(url){}
 };
@@ -586,18 +583,21 @@ async function startRealtime(){
   if(!_dbReady || !_supabase) return;
   try{
     _realtimeChannel = _supabase
-      .channel('workbuddy-changes')
-      .on('postgres_changes', {event:'*',schema:'public'},(payload)=>{
+      .channel('workbuddy-changes-v2')
+      .on('postgres_changes', {event:'*', schema:'public'}, (payload)=>{
         console.log('🔄 Realtime:', payload.eventType, payload.table);
-        // 数据变更时静默刷新
+        // 防抖 + 防重入
         if(_reloadTimer) clearTimeout(_reloadTimer);
-        _reloadTimer = setTimeout(()=>{
-          DB.pullAll().then(()=>{
-            if(['goals','checkin','notes','wishes','dashboard','trash'].includes(currentPage)){
-              renderPage(currentPage);
-            }
-          });
-        }, 500);
+        _reloadTimer = setTimeout(async ()=>{
+          if(_syncing) return;  // 同步中不重复拉
+          await DB.pullAll();
+          if(['goals','checkin','notes','wishes','dashboard','trash'].includes(currentPage)){
+            const st = document.getElementById('pageContainer')?.scrollTop || 0;
+            renderPage(currentPage);
+            const c = document.getElementById('pageContainer');
+            if(c) c.scrollTop = st;
+          }
+        }, 800);
       })
       .subscribe();
     console.log('✅ Realtime subscribed');
@@ -617,36 +617,43 @@ function toast(msg){
 
 // ============ 初始化 ============
 async function initApp(){
-  initData();
-
-  // 尝试连接 Supabase
-  const connected = await initSupabase();
-  if(connected){
-    await DB.pullAll();
-    await startRealtime();
-    console.log('✅ Supabase 已连接，数据已同步');
-  } else {
-    console.log('ℹ️ 未配置 Supabase，使用本地存储模式');
+  _initPhase = true;  // 初始化阶段禁止推送
+  try{
+    const connected = await initSupabase();
+    if(connected){
+      // 先拉取云端数据
+      await DB.pullAll();
+      // 初始化本地缺失的默认数据（不推送）
+      initDataLocal();
+      await startRealtime();
+      console.log('✅ Supabase 已连接，数据已同步');
+    } else {
+      initDataLocal();
+      console.log('ℹ️ 未配置 Supabase，使用本地存储模式');
+    }
+  }catch(e){ console.warn('Init error:', e.message); initDataLocal(); }
+  finally{
+    _initPhase = false;  // 初始化完成，允许推送
   }
-
   navTo('goals');
 }
 
-function initData(){
-  if(!localStorage.getItem('yk_goals')) DB.save('goals', []);
-  if(!localStorage.getItem('yk_checkins')) DB.save('checkins', []);
-  if(!localStorage.getItem('yk_checkin_logs')) DB.save('checkin_logs', {});
-  if(!localStorage.getItem('yk_notes')) DB.save('notes', []);
-  if(!localStorage.getItem('yk_wishes')) DB.save('wishes', []);
-  if(!localStorage.getItem('yk_trash')) DB.save('trash', []);
-  if(!localStorage.getItem('yk_chat')) DB.save('chat', []);
+// 只写本地，不推送 Supabase
+function initDataLocal(){
+  if(!localStorage.getItem('yk_goals')) localStorage.setItem('yk_goals','[]');
+  if(!localStorage.getItem('yk_checkins')) localStorage.setItem('yk_checkins','[]');
+  if(!localStorage.getItem('yk_checkin_logs')) localStorage.setItem('yk_checkin_logs','{}');
+  if(!localStorage.getItem('yk_notes')) localStorage.setItem('yk_notes','[]');
+  if(!localStorage.getItem('yk_wishes')) localStorage.setItem('yk_wishes','[]');
+  if(!localStorage.getItem('yk_trash')) localStorage.setItem('yk_trash','[]');
+  if(!localStorage.getItem('yk_chat')) localStorage.setItem('yk_chat','[]');
   if(!localStorage.getItem('yk_cats')){
-    DB.save('cats', {
+    localStorage.setItem('yk_cats', JSON.stringify({
       goals:[{id:'c0',name:'默认',color:'#bfa3e8'},{id:'c1',name:'工作',color:'#f0a8c4'},{id:'c2',name:'学习',color:'#a8d8b9'}],
       checkins:[{id:'c0',name:'默认',color:'#bfa3e8'},{id:'c1',name:'健康',color:'#f0a8c4'}],
       notes:[{id:'c0',name:'默认',color:'#bfa3e8'},{id:'c1',name:'灵感',color:'#f0a8c4'}],
       wishes:[{id:'c0',name:'默认',color:'#bfa3e8'},{id:'c1',name:'旅行',color:'#f0a8c4'}],
-    });
+    }));
   }
 }
 
@@ -1132,7 +1139,18 @@ async function connectSupabase(){
   const ok = await initSupabase();
   if(!ok){ toast('❌ 连接失败，请检查 URL 和 Key 是否正确'); setSupabaseConfig(null); return; }
 
-  // 首次连接：把本地数据推送到 Supabase
+  // 初始化阶段：禁止推送
+  _initPhase = true;
+  try{
+    // 先拉取云端数据
+    await DB.pullAll();
+    // 初始化本地缺失的默认数据
+    initDataLocal();
+  }catch(e){ console.warn('Connect sync error:', e.message); }
+  finally{
+    _initPhase = false;
+  }
+  // 把本地数据推送（只 upsert 不 delete）
   const keys = ['goals','checkins','checkin_logs','notes','wishes','trash','cats','chat'];
   for(const k of keys){
     const val = DB.load(k, k==='checkin_logs'?{}:(k==='cats'?{}:[]));
